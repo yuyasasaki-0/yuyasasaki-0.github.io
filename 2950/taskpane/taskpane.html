@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>Mail Checker</title>
+    <link rel="stylesheet" href="taskpane.css" />
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+    <script src="../shared/storage.js"></script>
+    <script src="../shared/settings.js"></script>
+    <script src="../shared/engine.js"></script>
+    <script src="../shared/readSecurity.js"></script>
+    <script src="taskpane.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>Mail Checker</h1>
+        <div id="status" class="status" role="status" aria-live="polite"></div>
+      </header>
+
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="check" role="tab" aria-selected="true">Check</button>
+        <button class="tab" data-tab="settings" role="tab" aria-selected="false">Settings</button>
+        <button class="tab" data-tab="advanced" role="tab" aria-selected="false">Advanced</button>
+      </nav>
+
+      <main>
+        <section id="tab-check" class="tab-panel active" role="tabpanel">
+          <div class="row">
+            <button id="btn-run" class="primary">Run Check</button>
+            <button id="btn-apply" class="secondary" disabled>Apply Recipient Changes</button>
+            <button id="btn-security" class="secondary" disabled>Security Scan (Read)</button>
+          </div>
+
+          <div id="check-summary" class="card"></div>
+          <div id="security-summary" class="card"></div>
+          <div id="check-recipients" class="card"></div>
+          <div id="check-attachments" class="card"></div>
+          <div id="check-alerts" class="card"></div>
+        </section>
+
+        <section id="tab-settings" class="tab-panel" role="tabpanel">
+          <form id="settings-form" class="card">
+            <h2>General</h2>
+            <div class="grid">
+              <label><input type="checkbox" id="g-enableForgottenToAttachAlert" /> Forgotten attachment warning</label>
+              <label><input type="checkbox" id="g-isDoNotConfirmationIfAllRecipientsAreSameDomain" /> Skip confirmation if all internal</label>
+              <label><input type="checkbox" id="g-isShowConfirmationToMultipleDomain" /> Always confirm for multiple external domains</label>
+              <label><input type="checkbox" id="g-isDoDoNotConfirmationIfAllWhite" /> Skip confirmation if all auto-checked</label>
+              <label><input type="checkbox" id="g-isAutoCheckIfAllRecipientsAreSameDomain" /> Auto-check internal recipients</label>
+              <label><input type="checkbox" id="g-isEnableRecipientsAreSortedByDomain" /> Sort recipients by domain (display)</label>
+              <label><input type="checkbox" id="g-isAutoAddSenderToCc" /> Auto add sender to Cc</label>
+              <label><input type="checkbox" id="g-isAutoAddSenderToBcc" /> Auto add sender to Bcc</label>
+              <label><input type="checkbox" id="g-isAutoCheckAttachments" /> Auto-check attachments</label>
+              <label><input type="checkbox" id="g-isNotTreatedAsAttachmentsAtHtmlEmbeddedFiles" /> Ignore inline attachments</label>
+            </div>
+
+            <h2>External Domains</h2>
+            <div class="grid">
+              <label>
+                Threshold (To/Cc external domains)
+                <input type="number" id="ex-target" min="0" step="1" />
+              </label>
+              <label><input type="checkbox" id="ex-warn" /> Warn when exceeding threshold</label>
+              <label><input type="checkbox" id="ex-prohibit" /> Prohibit when exceeding threshold</label>
+              <label><input type="checkbox" id="ex-autoBcc" /> Auto-change external To/Cc to Bcc</label>
+            </div>
+
+            <h2>Force Bcc</h2>
+            <div class="grid">
+              <label><input type="checkbox" id="fb-enable" /> Force change recipients to Bcc</label>
+              <label>
+                Keep this address in To (optional)
+                <input type="text" id="fb-toRecipient" placeholder="user@contoso.com" />
+              </label>
+              <label><input type="checkbox" id="fb-includeInternal" /> Include internal recipients too</label>
+            </div>
+
+            <h2>Attachments</h2>
+            <div class="grid">
+              <label><input type="checkbox" id="att-warnEncryptedZip" /> Warn on (possible) encrypted ZIP</label>
+              <label><input type="checkbox" id="att-prohibitEncryptedZip" /> Prohibit on (possible) encrypted ZIP</label>
+              <label><input type="checkbox" id="att-prohibitAll" /> Prohibit sending when attachments exist</label>
+              <label><input type="checkbox" id="att-warnRealFile" /> Recommend attaching as a link</label>
+            </div>
+
+            <h2>Received Mail Security</h2>
+            <div class="grid">
+              <label><input type="checkbox" id="sec-enable" /> Enable security features</label>
+              <label><input type="checkbox" id="sec-subjectKeywords" /> Alert on subject keywords (read)</label>
+              <label><input type="checkbox" id="sec-headerAnalysis" /> Analyze mail headers (SPF/DKIM/DMARC)</label>
+              <label><input type="checkbox" id="sec-warnSpf" /> Warn when SPF fails</label>
+              <label><input type="checkbox" id="sec-warnDkim" /> Warn when DKIM fails</label>
+              <label><input type="checkbox" id="sec-attachments" /> Attachment security scan (read)</label>
+              <label><input type="checkbox" id="sec-warnBeforeOpen" /> Warn before opening attachments</label>
+              <label><input type="checkbox" id="sec-warnEncryptedZip" /> Warn on encrypted ZIP</label>
+              <label><input type="checkbox" id="sec-warnZipLnk" /> Warn when ZIP contains .lnk</label>
+              <label><input type="checkbox" id="sec-warnZipOne" /> Warn when ZIP contains .one</label>
+              <label><input type="checkbox" id="sec-warnZipMacroOffice" /> Warn when ZIP contains macro Office</label>
+              <label><input type="checkbox" id="sec-warnMacroOffice" /> Warn on macro-enabled Office files</label>
+              <label><input type="checkbox" id="sec-spoofing" /> Warn on spoofing risk</label>
+              <label><input type="checkbox" id="sec-dmarcNotImpl" /> Warn when DMARC not PASS</label>
+            </div>
+
+            <h2>Internal Domains</h2>
+            <p class="hint">One domain per line. Example: <code>@contoso.com</code> or <code>contoso.com</code></p>
+            <textarea id="list-internalDomains" rows="5" spellcheck="false"></textarea>
+
+            <h2>Whitelist</h2>
+            <p class="hint">One entry per line. Format: <code>pattern[,skip]</code> where skip is <code>Y</code>/<code>N</code>.</p>
+            <textarea id="list-whitelist" rows="5" spellcheck="false"></textarea>
+
+            <div class="row">
+              <button id="btn-save" type="button" class="primary">Save</button>
+              <button id="btn-reset" type="button" class="secondary">Reset to Defaults</button>
+              <button id="btn-load-editor" type="button" class="secondary">Open in JSON Editor</button>
+            </div>
+          </form>
+        </section>
+
+        <section id="tab-advanced" class="tab-panel" role="tabpanel">
+          <div class="card">
+            <h2>JSON Editor</h2>
+            <div class="row">
+              <button id="btn-export-json" class="secondary">Download JSON</button>
+              <label class="file">
+                <input id="file-import-json" type="file" accept="application/json,.json" />
+                Import JSON
+              </label>
+              <button id="btn-apply-json" class="primary">Apply JSON</button>
+            </div>
+            <textarea id="json-editor" rows="22" spellcheck="false"></textarea>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
