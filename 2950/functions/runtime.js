@@ -18,6 +18,237 @@
     return String(value || "").slice(0, String(prefix || "").length) === String(prefix || "");
   }
 
+  function endsWith(value, suffix) {
+    var s = String(value || "");
+    var suf = String(suffix || "");
+    if (!suf) return false;
+    return s.slice(s.length - suf.length) === suf;
+  }
+
+  function domainSuffixFromAddress(address) {
+    var a = normalizeString(address);
+    if (!a) return "";
+    var at = a.lastIndexOf("@");
+    if (at < 0) return "";
+    return lower(a.slice(at)); // includes "@"
+  }
+
+  function normalizeDomainSuffix(value) {
+    var v = lower(normalizeString(value));
+    if (!v) return "";
+    if (v.indexOf("@") === 0) return v;
+    if (v.indexOf("@") >= 0) return v.slice(v.lastIndexOf("@"));
+    return "@" + v;
+  }
+
+  function buildInternalDomains(settings, senderDomainSuffix) {
+    var list = [];
+    try {
+      if (settings && Array.isArray(settings.internalDomains)) {
+        for (var i = 0; i < settings.internalDomains.length; i++) {
+          var row = settings.internalDomains[i];
+          if (!row) continue;
+          var d = normalizeString(row.domain != null ? row.domain : row.Domain);
+          var suf = normalizeDomainSuffix(d);
+          if (suf) list.push(suf);
+        }
+      }
+    } catch (_e) {}
+    if (senderDomainSuffix) list.push(senderDomainSuffix);
+    // uniq + lower
+    var seen = {};
+    var out = [];
+    for (var j = 0; j < list.length; j++) {
+      var k = lower(list[j]);
+      if (!k || seen[k]) continue;
+      seen[k] = true;
+      out.push(k);
+    }
+    return out;
+  }
+
+  function isInternalAddress(address, internalDomains) {
+    var a = lower(normalizeString(address));
+    if (!a) return false;
+    if (!Array.isArray(internalDomains) || internalDomains.length === 0) return false;
+    for (var i = 0; i < internalDomains.length; i++) {
+      var suf = internalDomains[i];
+      if (!suf) continue;
+      if (endsWith(a, suf)) return true;
+    }
+    return false;
+  }
+
+  function isDistributionListRecipient(recipient) {
+    if (!recipient) return false;
+    try {
+      var rt = recipient.recipientType != null ? recipient.recipientType : recipient.RecipientType;
+      if (rt == null) return false;
+      var s = lower(rt);
+      return s.indexOf("distribution") >= 0 || s.indexOf("group") >= 0;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  async function enrichSnapshotWithEws(snapshot, settings, timeoutMs) {
+    if (!snapshot || !settings) return snapshot;
+
+    var g = (settings && settings.general) || {};
+    var wantDl =
+      !!g.enableGetContactGroupMembers ||
+      !!g.enableGetExchangeDistributionListMembers;
+    var wantContacts =
+      !!g.isAutoCheckRegisteredInContacts ||
+      !!g.isWarningIfRecipientsIsNotRegistered ||
+      !!g.isProhibitsSendingMailIfRecipientsIsNotRegistered;
+
+    if (!wantDl && !wantContacts) return snapshot;
+
+    var ews = ns.ews;
+    var canEws = !!(ews && typeof ews.canUseEws === "function" && ews.canUseEws());
+
+    var resolved = { expandedGroups: [], contacts: null, contactsLookupFailed: false };
+
+    if (!canEws) {
+      if (wantContacts) resolved.contactsLookupFailed = true;
+      snapshot.resolved = resolved;
+      return snapshot;
+    }
+
+    var internalDomains = buildInternalDomains(settings, domainSuffixFromAddress(snapshot.senderEmailAddress));
+
+    var deadline = 0;
+    try {
+      var maxBudget = Math.min(2200, Math.max(600, (timeoutMs || 0) - 1800));
+      deadline = Date.now() + maxBudget;
+    } catch (_e2) {
+      deadline = 0;
+    }
+
+    function timeLeft() {
+      try {
+        return deadline ? deadline - Date.now() : 0;
+      } catch (_e3) {
+        return 0;
+      }
+    }
+
+    function collectDlCandidates(list, field, outList, seen) {
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i];
+        if (!r) continue;
+        var email = normalizeString(r.emailAddress);
+        if (!email || email.indexOf("@") < 0) continue;
+        var key = lower(email);
+        if (seen[key]) continue;
+        seen[key] = true;
+        if (!isDistributionListRecipient(r)) continue;
+        if (internalDomains.length > 0 && !isInternalAddress(email, internalDomains)) continue;
+        outList.push({ emailAddress: email, displayName: normalizeString(r.displayName), field: field });
+      }
+    }
+
+    if (wantDl && typeof ews.expandDlCached === "function") {
+      try {
+        var candidates = [];
+        var seenDl = {};
+        collectDlCandidates(snapshot.recipients && snapshot.recipients.to ? snapshot.recipients.to : [], "To", candidates, seenDl);
+        collectDlCandidates(snapshot.recipients && snapshot.recipients.cc ? snapshot.recipients.cc : [], "Cc", candidates, seenDl);
+        collectDlCandidates(snapshot.recipients && snapshot.recipients.bcc ? snapshot.recipients.bcc : [], "Bcc", candidates, seenDl);
+
+        for (var c = 0; c < candidates.length && c < 3; c++) {
+          if (timeLeft() < 300) break;
+          var cand = candidates[c];
+          var perTimeout = Math.max(300, Math.min(900, timeLeft()));
+          var r1 = await ews.expandDlCached(cand.emailAddress, { timeoutMs: perTimeout });
+          if (!r1 || !r1.ok || !Array.isArray(r1.members) || r1.members.length === 0) continue;
+
+          var members = r1.members
+            .map(function (m) {
+              return {
+                emailAddress: normalizeString(m && m.emailAddress),
+                displayName: normalizeString(m && m.displayName),
+              };
+            })
+            .filter(function (m) {
+              return m.emailAddress && m.emailAddress.indexOf("@") >= 0;
+            });
+
+          if (members.length === 0) continue;
+
+          resolved.expandedGroups.push({
+            emailAddress: cand.emailAddress,
+            displayName: cand.displayName,
+            field: cand.field,
+            members: members,
+          });
+        }
+      } catch (_e4) {}
+    }
+
+    if (wantContacts && typeof ews.resolveInContactsCached === "function") {
+      try {
+        var emails = [];
+        function addRecipients(list) {
+          for (var i = 0; i < list.length; i++) {
+            var r = list[i];
+            if (!r) continue;
+            var email = normalizeString(r.emailAddress);
+            if (!email || email.indexOf("@") < 0) continue;
+            if (internalDomains.length > 0 && isInternalAddress(email, internalDomains)) continue;
+            emails.push(email);
+          }
+        }
+
+        addRecipients((snapshot.recipients && snapshot.recipients.to) || []);
+        addRecipients((snapshot.recipients && snapshot.recipients.cc) || []);
+        addRecipients((snapshot.recipients && snapshot.recipients.bcc) || []);
+
+        for (var g2 = 0; g2 < resolved.expandedGroups.length; g2++) {
+          var grp = resolved.expandedGroups[g2];
+          var members = (grp && grp.members) || [];
+          for (var m2 = 0; m2 < members.length; m2++) {
+            var em = normalizeString(members[m2] && members[m2].emailAddress);
+            if (!em || em.indexOf("@") < 0) continue;
+            if (internalDomains.length > 0 && isInternalAddress(em, internalDomains)) continue;
+            emails.push(em);
+          }
+        }
+
+        var seen = {};
+        var uniq = [];
+        for (var u = 0; u < emails.length; u++) {
+          var k2 = lower(emails[u]);
+          if (!k2 || seen[k2]) continue;
+          seen[k2] = true;
+          uniq.push(emails[u]);
+        }
+
+        var contacts = {};
+        for (var q = 0; q < uniq.length; q++) {
+          if (timeLeft() < 250) break;
+          var email2 = uniq[q];
+          var perTimeout2 = Math.max(250, Math.min(700, timeLeft()));
+          var r2 = await ews.resolveInContactsCached(email2, { timeoutMs: perTimeout2 });
+          if (r2 && r2.ok && typeof r2.value === "boolean") {
+            contacts[lower(email2)] = r2.value;
+          } else if (r2 && !r2.ok) {
+            resolved.contactsLookupFailed = true;
+          }
+        }
+
+        resolved.contacts = contacts;
+      } catch (_e5) {
+        resolved.contactsLookupFailed = true;
+        resolved.contacts = null;
+      }
+    }
+
+    snapshot.resolved = resolved;
+    return snapshot;
+  }
+
   function withTimeout(promise, ms, timeoutValue) {
     return new Promise(function (resolve) {
       var done = false;
@@ -263,7 +494,7 @@
       attachments = [];
     }
 
-    return {
+    var snap = {
       displayLanguage: displayLanguage,
       senderEmailAddress: senderEmail,
       itemType: itemType,
@@ -273,6 +504,12 @@
       recipients: { to: to, cc: cc, bcc: bcc },
       attachments: attachments,
     };
+
+    try {
+      await enrichSnapshotWithEws(snap, settings, timeoutMs);
+    } catch (_e6) {}
+
+    return snap;
   }
 
   function sameEmailLists(a, b) {

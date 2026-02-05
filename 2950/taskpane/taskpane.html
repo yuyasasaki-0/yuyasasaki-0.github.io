@@ -5,13 +5,14 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta name="robots" content="noindex,nofollow" />
     <title>Mail Checker</title>
-    <link rel="stylesheet" href="taskpane.css?v=2953" />
+    <link rel="stylesheet" href="taskpane.css?v=2954" />
     <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-    <script src="../shared/storage.js?v=2953"></script>
-    <script src="../shared/settings.js?v=2953"></script>
-    <script src="../shared/engine.js?v=2953"></script>
-    <script src="../shared/readSecurity.js?v=2953"></script>
-    <script src="taskpane.js?v=2953"></script>
+    <script src="../shared/storage.js?v=2954"></script>
+    <script src="../shared/settings.js?v=2954"></script>
+    <script src="../shared/ews.js?v=2954"></script>
+    <script src="../shared/engine.js?v=2954"></script>
+    <script src="../shared/readSecurity.js?v=2954"></script>
+    <script src="taskpane.js?v=2954"></script>
   </head>
   <body>
     <div id="app">
@@ -55,6 +56,17 @@
               <label><input type="checkbox" id="g-isAutoAddSenderToBcc" /> Auto add sender to Bcc</label>
               <label><input type="checkbox" id="g-isAutoCheckAttachments" /> Auto-check attachments</label>
               <label><input type="checkbox" id="g-isNotTreatedAsAttachmentsAtHtmlEmbeddedFiles" /> Ignore inline attachments</label>
+            </div>
+
+            <h2>Contacts / Distribution Lists (EWS)</h2>
+            <div class="grid">
+              <label><input type="checkbox" id="g-enableGetExchangeDistributionListMembers" /> Expand Exchange distribution lists</label>
+              <label><input type="checkbox" id="g-exchangeDistributionListMembersAreWhite" /> Treat expanded members as whitelist</label>
+              <label><input type="checkbox" id="g-enableGetContactGroupMembers" /> Expand contact groups (best-effort)</label>
+              <label><input type="checkbox" id="g-contactGroupMembersAreWhite" /> Treat contact-group members as whitelist</label>
+              <label><input type="checkbox" id="g-isAutoCheckRegisteredInContacts" /> Auto-check recipients in Contacts</label>
+              <label><input type="checkbox" id="g-isWarningIfRecipientsIsNotRegistered" /> Warn if recipient not in Contacts</label>
+              <label><input type="checkbox" id="g-isProhibitsSendingMailIfRecipientsIsNotRegistered" /> Prohibit if recipient not in Contacts</label>
             </div>
 
             <h2>External Domains</h2>
@@ -132,6 +144,20 @@
               <button id="btn-apply-json" class="primary">Apply JSON</button>
             </div>
             <textarea id="json-editor" rows="22" spellcheck="false"></textarea>
+          </div>
+
+          <div class="card">
+            <h2>OutlookOkan CSV</h2>
+            <p class="hint">Import/export OutlookOkan-compatible CSV files. (Delay send CSV files are ignored.)</p>
+            <div class="row">
+              <button id="btn-export-csv" class="secondary">Download CSV Files</button>
+              <label class="file">
+                <input id="file-import-csv" type="file" accept=".csv,text/csv" multiple />
+                Import CSV Files
+              </label>
+              <button id="btn-apply-csv" class="primary">Apply CSV</button>
+            </div>
+            <div id="csv-summary" class="hint"></div>
           </div>
         </section>
       </main>

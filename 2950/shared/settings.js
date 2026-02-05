@@ -80,6 +80,7 @@
         exchangeDistributionListMembersAreWhite: true,
         isNotTreatedAsAttachmentsAtHtmlEmbeddedFiles: false,
         isDoNotUseAutoCcBccAttachedFileIfAllRecipientsAreInternalDomain: false,
+        isDoNotUseDeferredDeliveryIfAllRecipientsAreInternalDomain: false,
         isDoNotUseAutoCcBccKeywordIfAllRecipientsAreInternalDomain: false,
         isEnableRecipientsAreSortedByDomain: false,
         isAutoAddSenderToBcc: false,

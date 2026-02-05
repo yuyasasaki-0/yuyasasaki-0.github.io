@@ -167,6 +167,103 @@
     };
   }
 
+  function dedupeRecipientList(list) {
+    if (!Array.isArray(list)) return [];
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      if (!r || !r.key) continue;
+      if (seen[r.key]) continue;
+      seen[r.key] = true;
+      out.push(r);
+    }
+    return out;
+  }
+
+  function normalizeExpandedGroups(snapshot, recipientsActual) {
+    var resolved = snapshot && snapshot.resolved;
+    var groups = [];
+    try {
+      groups = Array.isArray(resolved && resolved.expandedGroups)
+        ? resolved.expandedGroups
+        : Array.isArray(resolved && resolved.groups)
+          ? resolved.groups
+          : [];
+    } catch (_e) {
+      groups = [];
+    }
+
+    var out = { to: [], cc: [], bcc: [], all: [], errors: [] };
+    if (!groups || groups.length === 0) return out;
+
+    var present = {};
+    try {
+      if (recipientsActual) {
+        var all = []
+          .concat(recipientsActual.to || [])
+          .concat(recipientsActual.cc || [])
+          .concat(recipientsActual.bcc || []);
+        for (var i = 0; i < all.length; i++) {
+          if (all[i] && all[i].key) present[all[i].key] = true;
+        }
+      }
+    } catch (_e2) {}
+
+    var seen = {};
+
+    function normalizeMembers(list) {
+      if (!Array.isArray(list)) return [];
+      var temp = [];
+      for (var i = 0; i < list.length; i++) {
+        var m = list[i];
+        if (!m) continue;
+        if (typeof m === "string") temp.push({ emailAddress: m, displayName: "" });
+        else temp.push(m);
+      }
+      return normalizeRecipients(temp);
+    }
+
+    for (var g = 0; g < groups.length; g++) {
+      var group = groups[g];
+      if (!group) continue;
+
+      var groupEmail = normalizeString(group.emailAddress != null ? group.emailAddress : group.address);
+      var groupKey = lower(groupEmail);
+      if (groupKey && Object.keys(present).length > 0 && !present[groupKey]) continue;
+
+      var label = normalizeString(group.displayName) || groupEmail;
+      var field = lower(normalizeString(group.field != null ? group.field : group.type));
+
+      var members = [];
+      try {
+        members = normalizeMembers(group.members || group.Members || []);
+      } catch (_e3) {
+        members = [];
+      }
+
+      for (var m2 = 0; m2 < members.length; m2++) {
+        var mem = members[m2];
+        if (!mem || !mem.key) continue;
+        if (seen[mem.key]) continue;
+        seen[mem.key] = true;
+
+        if (label) {
+          mem.expandedFrom = label;
+          mem.formatted = mem.formatted + " [" + label + "]";
+        }
+
+        if (field === "cc") out.cc.push(mem);
+        else if (field === "bcc") out.bcc.push(mem);
+        else out.to.push(mem);
+
+        out.all.push(mem);
+      }
+    }
+
+    return out;
+  }
+
   function toEmailList(list) {
     var out = [];
     for (var i = 0; i < list.length; i++) {
@@ -341,6 +438,14 @@
         return ja ? "Toが空のため送信者をToへ追加しました" : "Added sender to To (To was empty)";
       case "removedRecipients":
         return ja ? "設定により宛先を削除しました" : "Removed recipients by rule";
+      case "contactsNotRegisteredWarning":
+        return ja ? "連絡先(アドレス帳)未登録の宛先です" : "Recipient not found in Contacts";
+      case "contactsNotRegisteredProhibit":
+        return ja ? "連絡先(アドレス帳)未登録の宛先があるため送信禁止です" : "Send blocked: recipient not found in Contacts";
+      case "contactsLookupUnavailable":
+        return ja ? "連絡先(アドレス帳)の確認ができませんでした" : "Couldn't verify recipients in Contacts";
+      case "contactsLookupIncomplete":
+        return ja ? "連絡先(アドレス帳)の確認が未完了です" : "Contacts verification incomplete";
       case "allRecipientsRemoved":
         return ja ? "宛先がすべて削除されたため送信できません。" : "All recipients were removed; cannot send.";
       case "autoAddedRecipient":
@@ -559,7 +664,7 @@
     return next;
   }
 
-  function applyAutoCcBccRules(recipients, settings, checkList, locale, externalDomainCountAll, senderEmail) {
+  function applyAutoCcBccRules(recipients, settings, checkList, locale, externalDomainCountAll, senderEmail, matchExtraKeys) {
     var g = (settings && settings.general) || {};
 
     var allowKeywordRules = !(
@@ -581,6 +686,12 @@
       var all = to.concat(cc).concat(bcc);
       for (var i = 0; i < all.length; i++) {
         if (all[i].key && all[i].key.indexOf(t2) >= 0) return true;
+      }
+      if (Array.isArray(matchExtraKeys)) {
+        for (var j = 0; j < matchExtraKeys.length; j++) {
+          var k = matchExtraKeys[j];
+          if (k && String(k).indexOf(t2) >= 0) return true;
+        }
       }
       return false;
     }
@@ -719,16 +830,21 @@
     return dedupeRecipients(to, cc, bcc);
   }
 
-  function applyRecipientChecks(checkList, recipients, settings, locale, internalDomains, effectiveWhitelist) {
+  function applyRecipientChecks(checkList, recipients, settings, locale, internalDomains, effectiveWhitelist, expandedByField) {
     var alerts = Array.isArray(settings.alertAddresses) ? settings.alertAddresses : [];
+    var seen = {};
 
     function addAddress(outList, recipient) {
       var email = recipient.emailAddress;
+      var key = lower(email);
+      if (key && seen[key]) return;
+      if (key) seen[key] = true;
       var formatted = recipient.formatted || email;
 
       var external = !isInternalAddress(email, internalDomains);
       var white = isWhitelisted(email, effectiveWhitelist);
       var skip = white ? isSkipConfirmation(email, effectiveWhitelist) : false;
+      var expandedFrom = normalizeString(recipient.expandedFrom);
 
       outList.push({
         mailAddress: formatted,
@@ -737,6 +853,8 @@
         isWhite: white,
         isSkip: skip,
         isChecked: white,
+        isExpanded: !!expandedFrom,
+        expandedFrom: expandedFrom,
       });
 
       for (var i = 0; i < alerts.length; i++) {
@@ -762,6 +880,104 @@
     for (var i = 0; i < recipients.to.length; i++) addAddress(checkList.toAddresses, recipients.to[i]);
     for (var j = 0; j < recipients.cc.length; j++) addAddress(checkList.ccAddresses, recipients.cc[j]);
     for (var k = 0; k < recipients.bcc.length; k++) addAddress(checkList.bccAddresses, recipients.bcc[k]);
+
+    var ex = expandedByField || {};
+    var exTo = Array.isArray(ex.to) ? ex.to : [];
+    var exCc = Array.isArray(ex.cc) ? ex.cc : [];
+    var exBcc = Array.isArray(ex.bcc) ? ex.bcc : [];
+
+    for (var e1 = 0; e1 < exTo.length; e1++) addAddress(checkList.toAddresses, exTo[e1]);
+    for (var e2 = 0; e2 < exCc.length; e2++) addAddress(checkList.ccAddresses, exCc[e2]);
+    for (var e3 = 0; e3 < exBcc.length; e3++) addAddress(checkList.bccAddresses, exBcc[e3]);
+
+    return checkList;
+  }
+
+  function applyContactsChecks(checkList, settings, locale, contactsInfo) {
+    var g = (settings && settings.general) || {};
+
+    var autoCheck = !!g.isAutoCheckRegisteredInContacts;
+    var warn = !!g.isWarningIfRecipientsIsNotRegistered;
+    var prohibit = !!g.isProhibitsSendingMailIfRecipientsIsNotRegistered;
+
+    if (!autoCheck && !warn && !prohibit) return checkList;
+
+    var info = contactsInfo && contactsInfo.resolved && isObject(contactsInfo.resolved) ? contactsInfo.resolved : {};
+    var map = info && isObject(info.contacts) ? info.contacts : null;
+    var lookupFailed = !!(info && info.contactsLookupFailed);
+
+    if (!map) {
+      if (warn || prohibit) {
+        pushAlert(checkList, t(locale, "contactsLookupUnavailable"), true, false, false);
+      }
+      return checkList;
+    }
+
+    var unknown = [];
+
+    function handle(list) {
+      for (var i = 0; i < list.length; i++) {
+        var addr = list[i];
+        if (!addr || !addr.emailAddress) continue;
+        if (!addr.isExternal) continue; // internal domain is excluded
+        var k = lower(addr.emailAddress);
+        var v = map[k];
+
+        if (v === true) {
+          addr.isRegisteredInContacts = true;
+          if (autoCheck) addr.isChecked = true;
+          continue;
+        }
+
+        if (v === false) {
+          addr.isRegisteredInContacts = false;
+
+          if (prohibit) {
+            checkList.isCanNotSendMail = true;
+            checkList.canNotSendMailMessage = t(locale, "contactsNotRegisteredProhibit") + " [" + addr.mailAddress + "]";
+            return false;
+          }
+
+          if (warn) {
+            pushAlert(
+              checkList,
+              t(locale, "contactsNotRegisteredWarning") + " [" + addr.mailAddress + "]",
+              true,
+              false,
+              false
+            );
+          }
+          continue;
+        }
+
+        addr.isRegisteredInContacts = null;
+        unknown.push(addr.mailAddress);
+      }
+      return true;
+    }
+
+    if (!handle(checkList.toAddresses)) return checkList;
+    if (!handle(checkList.ccAddresses)) return checkList;
+    if (!handle(checkList.bccAddresses)) return checkList;
+
+    if (unknown.length > 0) {
+      pushAlert(
+        checkList,
+        t(locale, "contactsLookupIncomplete") +
+          " (" +
+          String(unknown.length) +
+          "): " +
+          unknown.slice(0, 3).join(", ") +
+          (unknown.length > 3 ? "..." : ""),
+        true,
+        false,
+        false
+      );
+    }
+
+    if (lookupFailed) {
+      pushAlert(checkList, t(locale, "contactsLookupUnavailable"), true, false, false);
+    }
 
     return checkList;
   }
@@ -1136,6 +1352,8 @@
       };
     }
 
+    var expanded = normalizeExpandedGroups(snapshot, recipients);
+
     computeAttachments(checkList, snapshot, settings, locale);
     checkForgotAttach(checkList, settings, locale);
     checkAlertKeywords(checkList, settings.alertKeywordsBody, checkList.mailBody);
@@ -1143,9 +1361,33 @@
 
     applyAutoAddMessagePreview(checkList, settings, locale);
 
-    var externalDomainCountAll = countRecipientExternalDomains(recipients, senderDomainSuffix, internalDomains, false);
+    var recipientsForCounts = {
+      to: recipients.to.concat(expanded.to),
+      cc: recipients.cc.concat(expanded.cc),
+      bcc: recipients.bcc.concat(expanded.bcc),
+    };
 
-    var autoAdd = applyAutoCcBccRules(recipients, settings, checkList, locale, externalDomainCountAll, senderEmail);
+    var externalDomainCountAll = countRecipientExternalDomains(
+      recipientsForCounts,
+      senderDomainSuffix,
+      internalDomains,
+      false
+    );
+
+    var expandedKeys = [];
+    for (var ek = 0; ek < expanded.all.length; ek++) {
+      if (expanded.all[ek] && expanded.all[ek].key) expandedKeys.push(expanded.all[ek].key);
+    }
+
+    var autoAdd = applyAutoCcBccRules(
+      recipients,
+      settings,
+      checkList,
+      locale,
+      externalDomainCountAll,
+      senderEmail,
+      expandedKeys
+    );
     recipients = autoAdd.recipients;
 
     recipients = externalDomainsChangeToBccIfNeeded(
@@ -1162,7 +1404,14 @@
       .concat(Array.isArray(settings.whitelist) ? settings.whitelist : [])
       .concat(Array.isArray(autoAdd.whitelistExtra) ? autoAdd.whitelistExtra : []);
 
-    applyRecipientChecks(checkList, recipients, settings, locale, internalDomains, effectiveWhitelist);
+    if (!!g.contactGroupMembersAreWhite || !!g.exchangeDistributionListMembersAreWhite) {
+      for (var wl = 0; wl < expanded.all.length; wl++) {
+        if (!expanded.all[wl] || !expanded.all[wl].emailAddress) continue;
+        effectiveWhitelist.push({ whiteName: expanded.all[wl].emailAddress, isSkipConfirmation: false });
+      }
+    }
+
+    applyRecipientChecks(checkList, recipients, settings, locale, internalDomains, effectiveWhitelist, expanded);
 
     if (!!g.isAutoCheckIfAllRecipientsAreSameDomain) {
       var i;
@@ -1171,14 +1420,35 @@
       for (i = 0; i < checkList.bccAddresses.length; i++) if (!checkList.bccAddresses[i].isExternal) checkList.bccAddresses[i].isChecked = true;
     }
 
+    applyContactsChecks(checkList, settings, locale, snapshot);
+    if (checkList.isCanNotSendMail) {
+      return {
+        checkList: checkList,
+        mutations: { to: toEmailList(recipients.to), cc: toEmailList(recipients.cc), bcc: toEmailList(recipients.bcc) },
+        showConfirmation: true,
+        locale: locale,
+      };
+    }
+
     checkRecipientsAndAttachments(checkList, settings, locale);
 
-    var allRecipients = recipients.to.concat(recipients.cc).concat(recipients.bcc);
+    var allRecipients = dedupeRecipientList(recipients.to.concat(recipients.cc).concat(recipients.bcc).concat(expanded.all));
     checkNameAndDomains(checkList, allRecipients, settings, locale);
     checkKeywordAndRecipients(checkList, allRecipients, settings, locale);
 
-    var externalDomainNumToAndCc = countRecipientExternalDomains(recipients, senderDomainSuffix, internalDomains, true);
-    checkList.recipientExternalDomainNumAll = countRecipientExternalDomains(recipients, senderDomainSuffix, internalDomains, false);
+    var recipientsForCounts2 = {
+      to: recipients.to.concat(expanded.to),
+      cc: recipients.cc.concat(expanded.cc),
+      bcc: recipients.bcc.concat(expanded.bcc),
+    };
+
+    var externalDomainNumToAndCc = countRecipientExternalDomains(recipientsForCounts2, senderDomainSuffix, internalDomains, true);
+    checkList.recipientExternalDomainNumAll = countRecipientExternalDomains(
+      recipientsForCounts2,
+      senderDomainSuffix,
+      internalDomains,
+      false
+    );
     externalDomainsWarningIfNeeded(checkList, settings, locale, externalDomainNumToAndCc);
 
     var showConfirmation = computeShowConfirmation(checkList, g);

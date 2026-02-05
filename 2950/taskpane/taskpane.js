@@ -16,6 +16,214 @@
     return String(value || "").slice(0, String(prefix || "").length) === String(prefix || "");
   }
 
+  function endsWith(value, suffix) {
+    var s = String(value || "");
+    var suf = String(suffix || "");
+    if (!suf) return false;
+    return s.slice(s.length - suf.length) === suf;
+  }
+
+  function domainSuffixFromAddress(address) {
+    var a = normalizeString(address);
+    if (!a) return "";
+    var at = a.lastIndexOf("@");
+    if (at < 0) return "";
+    return lower(a.slice(at)); // includes "@"
+  }
+
+  function normalizeDomainSuffix(value) {
+    var v = lower(normalizeString(value));
+    if (!v) return "";
+    if (v.indexOf("@") === 0) return v;
+    if (v.indexOf("@") >= 0) return v.slice(v.lastIndexOf("@"));
+    return "@" + v;
+  }
+
+  function buildInternalDomains(settings, senderDomainSuffix) {
+    var list = [];
+    try {
+      if (settings && Array.isArray(settings.internalDomains)) {
+        for (var i = 0; i < settings.internalDomains.length; i++) {
+          var row = settings.internalDomains[i];
+          if (!row) continue;
+          var d = normalizeString(row.domain != null ? row.domain : row.Domain);
+          var suf = normalizeDomainSuffix(d);
+          if (suf) list.push(suf);
+        }
+      }
+    } catch (_e) {}
+    if (senderDomainSuffix) list.push(senderDomainSuffix);
+    var seen = {};
+    var out = [];
+    for (var j = 0; j < list.length; j++) {
+      var k = lower(list[j]);
+      if (!k || seen[k]) continue;
+      seen[k] = true;
+      out.push(k);
+    }
+    return out;
+  }
+
+  function isInternalAddress(address, internalDomains) {
+    var a = lower(normalizeString(address));
+    if (!a) return false;
+    if (!Array.isArray(internalDomains) || internalDomains.length === 0) return false;
+    for (var i = 0; i < internalDomains.length; i++) {
+      var suf = internalDomains[i];
+      if (!suf) continue;
+      if (endsWith(a, suf)) return true;
+    }
+    return false;
+  }
+
+  function isDistributionListRecipient(recipient) {
+    if (!recipient) return false;
+    try {
+      var rt = recipient.recipientType != null ? recipient.recipientType : recipient.RecipientType;
+      if (rt == null) return false;
+      var s = lower(rt);
+      return s.indexOf("distribution") >= 0 || s.indexOf("group") >= 0;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  async function enrichSnapshotWithEws(snapshot, settings) {
+    if (!snapshot || !settings) return snapshot;
+
+    var g = (settings && settings.general) || {};
+    var wantDl = !!g.enableGetContactGroupMembers || !!g.enableGetExchangeDistributionListMembers;
+    var wantContacts =
+      !!g.isAutoCheckRegisteredInContacts ||
+      !!g.isWarningIfRecipientsIsNotRegistered ||
+      !!g.isProhibitsSendingMailIfRecipientsIsNotRegistered;
+
+    if (!wantDl && !wantContacts) return snapshot;
+
+    var ews = MailChecker && MailChecker.ews;
+    var canEws = !!(ews && typeof ews.canUseEws === "function" && ews.canUseEws());
+
+    var resolved = { expandedGroups: [], contacts: null, contactsLookupFailed: false };
+
+    if (!canEws) {
+      if (wantContacts) resolved.contactsLookupFailed = true;
+      snapshot.resolved = resolved;
+      return snapshot;
+    }
+
+    var internalDomains = buildInternalDomains(settings, domainSuffixFromAddress(snapshot.senderEmailAddress));
+
+    function collectDlCandidates(list, field, outList, seen) {
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i];
+        if (!r) continue;
+        var email = normalizeString(r.emailAddress);
+        if (!email || email.indexOf("@") < 0) continue;
+        var key = lower(email);
+        if (seen[key]) continue;
+        seen[key] = true;
+        if (!isDistributionListRecipient(r)) continue;
+        if (internalDomains.length > 0 && !isInternalAddress(email, internalDomains)) continue;
+        outList.push({ emailAddress: email, displayName: normalizeString(r.displayName), field: field });
+      }
+    }
+
+    if (wantDl && typeof ews.expandDlCached === "function") {
+      try {
+        var candidates = [];
+        var seenDl = {};
+        collectDlCandidates((snapshot.recipients && snapshot.recipients.to) || [], "To", candidates, seenDl);
+        collectDlCandidates((snapshot.recipients && snapshot.recipients.cc) || [], "Cc", candidates, seenDl);
+        collectDlCandidates((snapshot.recipients && snapshot.recipients.bcc) || [], "Bcc", candidates, seenDl);
+
+        for (var c = 0; c < candidates.length && c < 5; c++) {
+          var cand = candidates[c];
+          var r1 = await ews.expandDlCached(cand.emailAddress, { timeoutMs: 2500 });
+          if (!r1 || !r1.ok || !Array.isArray(r1.members) || r1.members.length === 0) continue;
+
+          var members = r1.members
+            .map(function (m) {
+              return {
+                emailAddress: normalizeString(m && m.emailAddress),
+                displayName: normalizeString(m && m.displayName),
+              };
+            })
+            .filter(function (m) {
+              return m.emailAddress && m.emailAddress.indexOf("@") >= 0;
+            });
+
+          if (members.length === 0) continue;
+
+          resolved.expandedGroups.push({
+            emailAddress: cand.emailAddress,
+            displayName: cand.displayName,
+            field: cand.field,
+            members: members,
+          });
+        }
+      } catch (_e2) {}
+    }
+
+    if (wantContacts && typeof ews.resolveInContactsCached === "function") {
+      try {
+        var emails = [];
+        function addRecipients(list) {
+          for (var i = 0; i < list.length; i++) {
+            var r = list[i];
+            if (!r) continue;
+            var email = normalizeString(r.emailAddress);
+            if (!email || email.indexOf("@") < 0) continue;
+            if (internalDomains.length > 0 && isInternalAddress(email, internalDomains)) continue;
+            emails.push(email);
+          }
+        }
+
+        addRecipients((snapshot.recipients && snapshot.recipients.to) || []);
+        addRecipients((snapshot.recipients && snapshot.recipients.cc) || []);
+        addRecipients((snapshot.recipients && snapshot.recipients.bcc) || []);
+
+        for (var g2 = 0; g2 < resolved.expandedGroups.length; g2++) {
+          var grp = resolved.expandedGroups[g2];
+          var members = (grp && grp.members) || [];
+          for (var m2 = 0; m2 < members.length; m2++) {
+            var em = normalizeString(members[m2] && members[m2].emailAddress);
+            if (!em || em.indexOf("@") < 0) continue;
+            if (internalDomains.length > 0 && isInternalAddress(em, internalDomains)) continue;
+            emails.push(em);
+          }
+        }
+
+        var seen = {};
+        var uniq = [];
+        for (var u = 0; u < emails.length; u++) {
+          var k2 = lower(emails[u]);
+          if (!k2 || seen[k2]) continue;
+          seen[k2] = true;
+          uniq.push(emails[u]);
+        }
+
+        var contacts = {};
+        for (var q = 0; q < uniq.length && q < 40; q++) {
+          var email2 = uniq[q];
+          var r2 = await ews.resolveInContactsCached(email2, { timeoutMs: 2000 });
+          if (r2 && r2.ok && typeof r2.value === "boolean") {
+            contacts[lower(email2)] = r2.value;
+          } else if (r2 && !r2.ok) {
+            resolved.contactsLookupFailed = true;
+          }
+        }
+
+        resolved.contacts = contacts;
+      } catch (_e3) {
+        resolved.contactsLookupFailed = true;
+        resolved.contacts = null;
+      }
+    }
+
+    snapshot.resolved = resolved;
+    return snapshot;
+  }
+
   function esc(text) {
     return String(text || "")
       .replace(/&/g, "&amp;")
@@ -173,6 +381,17 @@
       g.isNotTreatedAsAttachmentsAtHtmlEmbeddedFiles
     );
 
+    setCheckboxValue("g-enableGetExchangeDistributionListMembers", g.enableGetExchangeDistributionListMembers);
+    setCheckboxValue("g-exchangeDistributionListMembersAreWhite", g.exchangeDistributionListMembersAreWhite);
+    setCheckboxValue("g-enableGetContactGroupMembers", g.enableGetContactGroupMembers);
+    setCheckboxValue("g-contactGroupMembersAreWhite", g.contactGroupMembersAreWhite);
+    setCheckboxValue("g-isAutoCheckRegisteredInContacts", g.isAutoCheckRegisteredInContacts);
+    setCheckboxValue("g-isWarningIfRecipientsIsNotRegistered", g.isWarningIfRecipientsIsNotRegistered);
+    setCheckboxValue(
+      "g-isProhibitsSendingMailIfRecipientsIsNotRegistered",
+      g.isProhibitsSendingMailIfRecipientsIsNotRegistered
+    );
+
     setNumberValue("ex-target", ex.targetToAndCcExternalDomainsNum);
     setCheckboxValue("ex-warn", ex.isWarningWhenLargeNumberOfExternalDomains);
     setCheckboxValue("ex-prohibit", ex.isProhibitedWhenLargeNumberOfExternalDomains);
@@ -225,6 +444,16 @@
       "g-isNotTreatedAsAttachmentsAtHtmlEmbeddedFiles"
     );
 
+    next.general.enableGetExchangeDistributionListMembers = getCheckboxValue("g-enableGetExchangeDistributionListMembers");
+    next.general.exchangeDistributionListMembersAreWhite = getCheckboxValue("g-exchangeDistributionListMembersAreWhite");
+    next.general.enableGetContactGroupMembers = getCheckboxValue("g-enableGetContactGroupMembers");
+    next.general.contactGroupMembersAreWhite = getCheckboxValue("g-contactGroupMembersAreWhite");
+    next.general.isAutoCheckRegisteredInContacts = getCheckboxValue("g-isAutoCheckRegisteredInContacts");
+    next.general.isWarningIfRecipientsIsNotRegistered = getCheckboxValue("g-isWarningIfRecipientsIsNotRegistered");
+    next.general.isProhibitsSendingMailIfRecipientsIsNotRegistered = getCheckboxValue(
+      "g-isProhibitsSendingMailIfRecipientsIsNotRegistered"
+    );
+
     next.externalDomains = next.externalDomains || {};
     next.externalDomains.targetToAndCcExternalDomainsNum = getNumberValue("ex-target", 10);
     next.externalDomains.isWarningWhenLargeNumberOfExternalDomains = getCheckboxValue("ex-warn");
@@ -264,9 +493,10 @@
     return next;
   }
 
-  function downloadText(filename, text) {
+  function downloadText(filename, text, mimeType) {
     try {
-      var blob = new Blob([String(text || "")], { type: "application/json;charset=utf-8" });
+      var type = normalizeString(mimeType) || "text/plain;charset=utf-8";
+      var blob = new Blob([String(text || "")], { type: type });
       if (window.navigator && typeof window.navigator.msSaveBlob === "function") {
         window.navigator.msSaveBlob(blob, filename);
         return;
@@ -283,6 +513,743 @@
         } catch (_e) {}
       }, 0);
     } catch (_e2) {}
+  }
+
+  function parseBool(value) {
+    if (value == null) return null;
+    var v = lower(normalizeString(value));
+    if (!v) return null;
+    if (v === "yes" || v === "y" || v === "true" || v === "1") return true;
+    if (v === "no" || v === "n" || v === "false" || v === "0") return false;
+    return null;
+  }
+
+  function boolToYesNo(value) {
+    return value ? "Yes" : "No";
+  }
+
+  function parseIntOrNull(value) {
+    if (value == null) return null;
+    var s = normalizeString(value);
+    if (!s) return null;
+    var n = parseInt(s, 10);
+    return isFinite(n) ? n : null;
+  }
+
+  function parseCsv(text) {
+    var s = String(text || "");
+    var rows = [];
+    var row = [];
+    var field = "";
+    var inQuotes = false;
+
+    for (var i = 0; i < s.length; i++) {
+      var ch = s.charAt(i);
+
+      if (inQuotes) {
+        if (ch === "\"") {
+          if (s.charAt(i + 1) === "\"") {
+            field += "\"";
+            i++;
+          } else {
+            inQuotes = false;
+          }
+        } else {
+          field += ch;
+        }
+        continue;
+      }
+
+      if (ch === "\"") {
+        inQuotes = true;
+        continue;
+      }
+
+      if (ch === ",") {
+        row.push(field);
+        field = "";
+        continue;
+      }
+
+      if (ch === "\r") {
+        if (s.charAt(i + 1) === "\n") i++;
+        row.push(field);
+        field = "";
+        if (!(row.length === 1 && !normalizeString(row[0]))) rows.push(row);
+        row = [];
+        continue;
+      }
+
+      if (ch === "\n") {
+        row.push(field);
+        field = "";
+        if (!(row.length === 1 && !normalizeString(row[0]))) rows.push(row);
+        row = [];
+        continue;
+      }
+
+      field += ch;
+    }
+
+    row.push(field);
+    if (!(row.length === 1 && !normalizeString(row[0]))) rows.push(row);
+
+    return rows;
+  }
+
+  function csvEscape(value) {
+    var s = value == null ? "" : String(value);
+    if (/[\",\r\n]/.test(s)) return "\"" + s.replace(/\"/g, "\"\"") + "\"";
+    return s;
+  }
+
+  function toCsv(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) return "";
+    return (
+      rows
+        .map(function (row) {
+          var r = Array.isArray(row) ? row : [];
+          return r
+            .map(function (cell) {
+              return csvEscape(cell);
+            })
+            .join(",");
+        })
+        .join("\r\n") + "\r\n"
+    );
+  }
+
+  function getBaseName(fileName) {
+    var n = String(fileName || "");
+    n = n.replace(/^.*[\\/]/, "");
+    return n;
+  }
+
+  function applyOutlookOkanCsvFiles(settings, fileEntries) {
+    var next = JSON.parse(JSON.stringify(settings || {}));
+    var summary = [];
+
+    function setIf(rows, idx, setter) {
+      if (!rows || rows.length === 0) return;
+      var v = rows[0] && rows[0].length > idx ? rows[0][idx] : null;
+      if (v == null) return;
+      if (!normalizeString(v)) return;
+      setter(v);
+    }
+
+    function applyList(rows, mapper) {
+      var out = [];
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        if (!row) continue;
+        var item = mapper(row);
+        if (item) out.push(item);
+      }
+      return out;
+    }
+
+    next.general = next.general || {};
+    next.externalDomains = next.externalDomains || {};
+    next.forceAutoChangeRecipientsToBcc = next.forceAutoChangeRecipientsToBcc || {};
+    next.attachmentsSetting = next.attachmentsSetting || {};
+    next.autoAddMessage = next.autoAddMessage || {};
+    next.securityForReceivedMail = next.securityForReceivedMail || {};
+
+    var ignored = [];
+
+    for (var f = 0; f < fileEntries.length; f++) {
+      var fe = fileEntries[f];
+      if (!fe || !fe.name) continue;
+      var base = lower(getBaseName(fe.name));
+      var rows = parseCsv(String(fe.text || ""));
+
+      switch (base) {
+        case "generalsetting.csv": {
+          if (rows.length === 0) break;
+          var r0 = rows[0];
+          function b(i, key) {
+            if (r0.length <= i) return;
+            var v = parseBool(r0[i]);
+            if (v == null) return;
+            next.general[key] = v;
+          }
+          function s(i, key) {
+            if (r0.length <= i) return;
+            var v = normalizeString(r0[i]);
+            if (v === "") return;
+            next.general[key] = v;
+          }
+
+          b(0, "isDoNotConfirmationIfAllRecipientsAreSameDomain");
+          b(1, "isDoDoNotConfirmationIfAllWhite");
+          b(2, "isAutoCheckIfAllRecipientsAreSameDomain");
+          s(3, "languageCode");
+          b(4, "isShowConfirmationToMultipleDomain");
+          b(5, "enableForgottenToAttachAlert");
+          b(6, "enableGetContactGroupMembers");
+          b(7, "enableGetExchangeDistributionListMembers");
+          b(8, "contactGroupMembersAreWhite");
+          b(9, "exchangeDistributionListMembersAreWhite");
+          b(10, "isNotTreatedAsAttachmentsAtHtmlEmbeddedFiles");
+          b(11, "isDoNotUseAutoCcBccAttachedFileIfAllRecipientsAreInternalDomain");
+          b(12, "isDoNotUseDeferredDeliveryIfAllRecipientsAreInternalDomain");
+          b(13, "isDoNotUseAutoCcBccKeywordIfAllRecipientsAreInternalDomain");
+          b(14, "isEnableRecipientsAreSortedByDomain");
+          b(15, "isAutoAddSenderToBcc");
+          b(16, "isAutoCheckRegisteredInContacts");
+          b(17, "isAutoCheckRegisteredInContactsAndMemberOfContactLists");
+          b(18, "isCheckNameAndDomainsFromRecipients");
+          b(19, "isWarningIfRecipientsIsNotRegistered");
+          b(20, "isProhibitsSendingMailIfRecipientsIsNotRegistered");
+          b(21, "isShowConfirmationAtSendMeetingRequest");
+          b(22, "isAutoAddSenderToCc");
+          b(23, "isCheckNameAndDomainsIncludeSubject");
+          b(24, "isCheckNameAndDomainsFromSubject");
+          b(25, "isShowConfirmationAtSendTaskRequest");
+          b(26, "isAutoCheckAttachments");
+          b(27, "isCheckKeywordAndRecipientsIncludeSubject");
+
+          summary.push("Imported GeneralSetting.csv");
+          break;
+        }
+        case "internaldomainlist.csv": {
+          next.internalDomains = applyList(rows, function (r) {
+            var domain = normalizeString(r[0]);
+            return domain ? { domain: domain } : null;
+          });
+          summary.push("Imported InternalDomainList.csv (" + String(next.internalDomains.length) + ")");
+          break;
+        }
+        case "whitelist.csv": {
+          next.whitelist = applyList(rows, function (r) {
+            var whiteName = normalizeString(r[0]);
+            if (!whiteName) return null;
+            var skip = parseBool(r[1]);
+            return { whiteName: whiteName, isSkipConfirmation: skip === true };
+          });
+          summary.push("Imported Whitelist.csv (" + String(next.whitelist.length) + ")");
+          break;
+        }
+        case "alertaddresslist.csv": {
+          next.alertAddresses = applyList(rows, function (r) {
+            var target = normalizeString(r[0]);
+            if (!target) return null;
+            var isCanNotSend = parseBool(r[1]);
+            return { targetAddress: target, isCanNotSend: isCanNotSend === true, message: normalizeString(r[2]) };
+          });
+          summary.push("Imported AlertAddressList.csv (" + String(next.alertAddresses.length) + ")");
+          break;
+        }
+        case "alertkeywordandmessagelist.csv": {
+          next.alertKeywordsBody = applyList(rows, function (r) {
+            var kw = normalizeString(r[0]);
+            if (!kw) return null;
+            var isCanNotSend = parseBool(r[2]);
+            return { alertKeyword: kw, message: normalizeString(r[1]), isCanNotSend: isCanNotSend === true };
+          });
+          summary.push("Imported AlertKeywordAndMessageList.csv (" + String(next.alertKeywordsBody.length) + ")");
+          break;
+        }
+        case "alertkeywordandmessagelistforsubject.csv": {
+          next.alertKeywordsSubject = applyList(rows, function (r) {
+            var kw = normalizeString(r[0]);
+            if (!kw) return null;
+            var isCanNotSend = parseBool(r[2]);
+            return { alertKeyword: kw, message: normalizeString(r[1]), isCanNotSend: isCanNotSend === true };
+          });
+          summary.push("Imported AlertKeywordAndMessageListForSubject.csv (" + String(next.alertKeywordsSubject.length) + ")");
+          break;
+        }
+        case "autoccbcckeywordlist.csv": {
+          next.autoCcBccKeyword = applyList(rows, function (r) {
+            var keyword = normalizeString(r[0]);
+            var ccOrBcc = normalizeString(r[1]);
+            var addr = normalizeString(r[2]);
+            if (!keyword || !addr) return null;
+            return { keyword: keyword, ccOrBcc: ccOrBcc === "Cc" ? "Cc" : "Bcc", autoAddAddress: addr };
+          });
+          summary.push("Imported AutoCcBccKeywordList.csv (" + String(next.autoCcBccKeyword.length) + ")");
+          break;
+        }
+        case "autoccbccrecipientlist.csv": {
+          next.autoCcBccRecipient = applyList(rows, function (r) {
+            var targetRecipient = normalizeString(r[0]);
+            var ccOrBcc = normalizeString(r[1]);
+            var addr = normalizeString(r[2]);
+            if (!targetRecipient || !addr) return null;
+            return { targetRecipient: targetRecipient, ccOrBcc: ccOrBcc === "Cc" ? "Cc" : "Bcc", autoAddAddress: addr };
+          });
+          summary.push("Imported AutoCcBccRecipientList.csv (" + String(next.autoCcBccRecipient.length) + ")");
+          break;
+        }
+        case "autoccbccattachedfilelist.csv": {
+          next.autoCcBccAttachedFile = applyList(rows, function (r) {
+            var ccOrBcc = normalizeString(r[0]);
+            var addr = normalizeString(r[1]);
+            if (!addr) return null;
+            return { ccOrBcc: ccOrBcc === "Cc" ? "Cc" : "Bcc", autoAddAddress: addr };
+          });
+          summary.push("Imported AutoCcBccAttachedFileList.csv (" + String(next.autoCcBccAttachedFile.length) + ")");
+          break;
+        }
+        case "nameanddomains.csv": {
+          next.nameAndDomains = applyList(rows, function (r) {
+            var name = normalizeString(r[0]);
+            var domain = normalizeString(r[1]);
+            if (!name || !domain) return null;
+            return { name: name, domain: domain };
+          });
+          summary.push("Imported NameAndDomains.csv (" + String(next.nameAndDomains.length) + ")");
+          break;
+        }
+        case "keywordandrecipientslist.csv":
+        {
+          next.keywordAndRecipients = applyList(rows, function (r) {
+            var keyword = normalizeString(r[0]);
+            var recipient = normalizeString(r[1]);
+            if (!keyword || !recipient) return null;
+            return { keyword: keyword, recipient: recipient };
+          });
+          summary.push("Imported KeywordAndRecipientsList.csv (" + String(next.keywordAndRecipients.length) + ")");
+          break;
+        }
+        case "externaldomainswarningandautochangetobccsetting.csv": {
+          if (rows.length === 0) break;
+          var r1 = rows[0];
+          var num = parseIntOrNull(r1[0]);
+          if (num != null) next.externalDomains.targetToAndCcExternalDomainsNum = num;
+          var b1 = parseBool(r1[1]);
+          var b2 = parseBool(r1[2]);
+          var b3 = parseBool(r1[3]);
+          if (b1 != null) next.externalDomains.isWarningWhenLargeNumberOfExternalDomains = b1;
+          if (b2 != null) next.externalDomains.isProhibitedWhenLargeNumberOfExternalDomains = b2;
+          if (b3 != null) next.externalDomains.isAutoChangeToBccWhenLargeNumberOfExternalDomains = b3;
+          summary.push("Imported ExternalDomainsWarningAndAutoChangeToBccSetting.csv");
+          break;
+        }
+        case "forceautochangerecipientstobcc.csv": {
+          if (rows.length === 0) break;
+          var r2 = rows[0];
+          var b = parseBool(r2[0]);
+          if (b != null) next.forceAutoChangeRecipientsToBcc.isForceAutoChangeRecipientsToBcc = b;
+          next.forceAutoChangeRecipientsToBcc.toRecipient = normalizeString(r2[1]);
+          var b4 = parseBool(r2[2]);
+          if (b4 != null) next.forceAutoChangeRecipientsToBcc.isIncludeInternalDomain = b4;
+          summary.push("Imported ForceAutoChangeRecipientsToBcc.csv");
+          break;
+        }
+        case "attachmentssetting.csv": {
+          if (rows.length === 0) break;
+          var r3 = rows[0];
+          function ab(i, key) {
+            var v = parseBool(r3[i]);
+            if (v == null) return;
+            next.attachmentsSetting[key] = v;
+          }
+          ab(0, "isWarningWhenEncryptedZipIsAttached");
+          ab(1, "isProhibitedWhenEncryptedZipIsAttached");
+          ab(2, "isEnableAllAttachedFilesAreDetectEncryptedZip");
+          ab(3, "isAttachmentsProhibited");
+          ab(4, "isWarningWhenAttachedRealFile");
+          ab(5, "isEnableOpenAttachedFiles");
+          if (r3.length > 6) next.attachmentsSetting.targetAttachmentFileExtensionOfOpen = normalizeString(r3[6]);
+          ab(7, "isMustOpenBeforeCheckTheAttachedFiles");
+          ab(8, "isIgnoreMustOpenBeforeCheckTheAttachedFilesIfInternalDomain");
+          summary.push("Imported AttachmentsSetting.csv");
+          break;
+        }
+        case "attachmentprohibitedrecipients.csv": {
+          next.attachmentProhibitedRecipients = applyList(rows, function (r) {
+            var recipient = normalizeString(r[0]);
+            return recipient ? { recipient: recipient } : null;
+          });
+          summary.push("Imported AttachmentProhibitedRecipients.csv (" + String(next.attachmentProhibitedRecipients.length) + ")");
+          break;
+        }
+        case "attachmentalertrecipients.csv": {
+          next.attachmentAlertRecipients = applyList(rows, function (r) {
+            var recipient = normalizeString(r[0]);
+            if (!recipient) return null;
+            return { recipient: recipient, message: normalizeString(r[1]) };
+          });
+          summary.push("Imported AttachmentAlertRecipients.csv (" + String(next.attachmentAlertRecipients.length) + ")");
+          break;
+        }
+        case "recipientsandattachmentsname.csv": {
+          next.recipientsAndAttachmentsName = applyList(rows, function (r) {
+            var attachmentsName = normalizeString(r[0]);
+            var recipient = normalizeString(r[1]);
+            if (!attachmentsName || !recipient) return null;
+            return { attachmentsName: attachmentsName, recipient: recipient };
+          });
+          summary.push("Imported RecipientsAndAttachmentsName.csv (" + String(next.recipientsAndAttachmentsName.length) + ")");
+          break;
+        }
+        case "autodeleterecipientlist.csv": {
+          next.autoDeleteRecipients = applyList(rows, function (r) {
+            var recipient = normalizeString(r[0]);
+            return recipient ? { recipient: recipient } : null;
+          });
+          summary.push("Imported AutoDeleteRecipientList.csv (" + String(next.autoDeleteRecipients.length) + ")");
+          break;
+        }
+        case "autoaddmessage.csv": {
+          if (rows.length === 0) break;
+          var r4 = rows[0];
+          var b5 = parseBool(r4[0]);
+          var b6 = parseBool(r4[1]);
+          if (b5 != null) next.autoAddMessage.isAddToStart = b5;
+          if (b6 != null) next.autoAddMessage.isAddToEnd = b6;
+          next.autoAddMessage.messageOfAddToStart = normalizeString(r4[2]);
+          next.autoAddMessage.messageOfAddToEnd = normalizeString(r4[3]);
+          summary.push("Imported AutoAddMessage.csv");
+          break;
+        }
+        case "securityforreceivedmail.csv": {
+          if (rows.length === 0) break;
+          var r5 = rows[0];
+          function sb(i, key) {
+            var v = parseBool(r5[i]);
+            if (v == null) return;
+            next.securityForReceivedMail[key] = v;
+          }
+          sb(0, "isEnableSecurityForReceivedMail");
+          sb(1, "isEnableAlertKeywordOfSubjectWhenOpeningMailsData");
+          sb(2, "isEnableMailHeaderAnalysis");
+          sb(3, "isShowWarningWhenSpfFails");
+          sb(4, "isShowWarningWhenDkimFails");
+          sb(5, "isEnableWarningFeatureWhenOpeningAttachments");
+          sb(6, "isWarnBeforeOpeningAttachments");
+          sb(7, "isWarnBeforeOpeningEncryptedZip");
+          sb(8, "isWarnLinkFileInTheZip");
+          sb(9, "isWarnOneFileInTheZip");
+          sb(10, "isWarnOfficeFileWithMacroInTheZip");
+          sb(11, "isWarnBeforeOpeningAttachmentsThatContainMacros");
+          sb(12, "isShowWarningWhenSpoofingRisk");
+          sb(13, "isShowWarningWhenDmarcNotImplemented");
+          summary.push("Imported SecurityForReceivedMail.csv");
+          break;
+        }
+        case "alertkeywordofsubjectwhenopeningmaillist.csv": {
+          next.alertKeywordOfSubjectWhenOpeningMail = applyList(rows, function (r) {
+            var kw = normalizeString(r[0]);
+            if (!kw) return null;
+            return { alertKeyword: kw, message: normalizeString(r[1]) };
+          });
+          summary.push(
+            "Imported AlertKeywordOfSubjectWhenOpeningMailList.csv (" +
+              String(next.alertKeywordOfSubjectWhenOpeningMail.length) +
+              ")"
+          );
+          break;
+        }
+        case "deferreddeliveryminutes.csv": {
+          ignored.push(getBaseName(fe.name));
+          break;
+        }
+        default:
+          // Unknown CSV: ignore
+          break;
+      }
+    }
+
+    try {
+      if (MailChecker && MailChecker.settings && typeof MailChecker.settings._normalize === "function") {
+        next = MailChecker.settings._normalize(next);
+      }
+    } catch (_e2) {}
+
+    if (ignored.length > 0) {
+      summary.push("Ignored: " + ignored.join(", "));
+    }
+
+    return { settings: next, summary: summary };
+  }
+
+  function exportOutlookOkanCsvFiles(settings) {
+    var s = settings || {};
+    var g = (s.general || {});
+    var out = [];
+
+    function pushFile(name, rows) {
+      out.push({ name: name, text: toCsv(rows) });
+    }
+
+    pushFile("GeneralSetting.csv", [
+      [
+        boolToYesNo(!!g.isDoNotConfirmationIfAllRecipientsAreSameDomain),
+        boolToYesNo(!!g.isDoDoNotConfirmationIfAllWhite),
+        boolToYesNo(!!g.isAutoCheckIfAllRecipientsAreSameDomain),
+        normalizeString(g.languageCode),
+        boolToYesNo(!!g.isShowConfirmationToMultipleDomain),
+        boolToYesNo(g.enableForgottenToAttachAlert !== false),
+        boolToYesNo(!!g.enableGetContactGroupMembers),
+        boolToYesNo(!!g.enableGetExchangeDistributionListMembers),
+        boolToYesNo(g.contactGroupMembersAreWhite !== false),
+        boolToYesNo(g.exchangeDistributionListMembersAreWhite !== false),
+        boolToYesNo(!!g.isNotTreatedAsAttachmentsAtHtmlEmbeddedFiles),
+        boolToYesNo(!!g.isDoNotUseAutoCcBccAttachedFileIfAllRecipientsAreInternalDomain),
+        boolToYesNo(!!g.isDoNotUseDeferredDeliveryIfAllRecipientsAreInternalDomain),
+        boolToYesNo(!!g.isDoNotUseAutoCcBccKeywordIfAllRecipientsAreInternalDomain),
+        boolToYesNo(!!g.isEnableRecipientsAreSortedByDomain),
+        boolToYesNo(!!g.isAutoAddSenderToBcc),
+        boolToYesNo(!!g.isAutoCheckRegisteredInContacts),
+        boolToYesNo(!!g.isAutoCheckRegisteredInContactsAndMemberOfContactLists),
+        boolToYesNo(!!g.isCheckNameAndDomainsFromRecipients),
+        boolToYesNo(!!g.isWarningIfRecipientsIsNotRegistered),
+        boolToYesNo(!!g.isProhibitsSendingMailIfRecipientsIsNotRegistered),
+        boolToYesNo(!!g.isShowConfirmationAtSendMeetingRequest),
+        boolToYesNo(!!g.isAutoAddSenderToCc),
+        boolToYesNo(!!g.isCheckNameAndDomainsIncludeSubject),
+        boolToYesNo(!!g.isCheckNameAndDomainsFromSubject),
+        boolToYesNo(!!g.isShowConfirmationAtSendTaskRequest),
+        boolToYesNo(!!g.isAutoCheckAttachments),
+        boolToYesNo(!!g.isCheckKeywordAndRecipientsIncludeSubject),
+      ],
+    ]);
+
+    if (Array.isArray(s.internalDomains) && s.internalDomains.length > 0) {
+      pushFile(
+        "InternalDomainList.csv",
+        s.internalDomains
+          .map(function (d) {
+            return d && d.domain ? [d.domain] : null;
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.whitelist) && s.whitelist.length > 0) {
+      pushFile(
+        "Whitelist.csv",
+        s.whitelist
+          .map(function (w) {
+            if (!w || !w.whiteName) return null;
+            return [w.whiteName, boolToYesNo(!!w.isSkipConfirmation)];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.alertAddresses) && s.alertAddresses.length > 0) {
+      pushFile(
+        "AlertAddressList.csv",
+        s.alertAddresses
+          .map(function (a) {
+            if (!a || !a.targetAddress) return null;
+            return [a.targetAddress, boolToYesNo(!!a.isCanNotSend), normalizeString(a.message)];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.alertKeywordsBody) && s.alertKeywordsBody.length > 0) {
+      pushFile(
+        "AlertKeywordAndMessageList.csv",
+        s.alertKeywordsBody
+          .map(function (a) {
+            if (!a || !a.alertKeyword) return null;
+            return [a.alertKeyword, normalizeString(a.message), boolToYesNo(!!a.isCanNotSend)];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.alertKeywordsSubject) && s.alertKeywordsSubject.length > 0) {
+      pushFile(
+        "AlertKeywordAndMessageListForSubject.csv",
+        s.alertKeywordsSubject
+          .map(function (a) {
+            if (!a || !a.alertKeyword) return null;
+            return [a.alertKeyword, normalizeString(a.message), boolToYesNo(!!a.isCanNotSend)];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.autoCcBccKeyword) && s.autoCcBccKeyword.length > 0) {
+      pushFile(
+        "AutoCcBccKeywordList.csv",
+        s.autoCcBccKeyword
+          .map(function (r) {
+            if (!r || !r.keyword || !r.autoAddAddress) return null;
+            return [r.keyword, r.ccOrBcc === "Cc" ? "Cc" : "Bcc", r.autoAddAddress];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.autoCcBccRecipient) && s.autoCcBccRecipient.length > 0) {
+      pushFile(
+        "AutoCcBccRecipientList.csv",
+        s.autoCcBccRecipient
+          .map(function (r) {
+            if (!r || !r.targetRecipient || !r.autoAddAddress) return null;
+            return [r.targetRecipient, r.ccOrBcc === "Cc" ? "Cc" : "Bcc", r.autoAddAddress];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.autoCcBccAttachedFile) && s.autoCcBccAttachedFile.length > 0) {
+      pushFile(
+        "AutoCcBccAttachedFileList.csv",
+        s.autoCcBccAttachedFile
+          .map(function (r) {
+            if (!r || !r.autoAddAddress) return null;
+            return [r.ccOrBcc === "Cc" ? "Cc" : "Bcc", r.autoAddAddress];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.nameAndDomains) && s.nameAndDomains.length > 0) {
+      pushFile(
+        "NameAndDomains.csv",
+        s.nameAndDomains
+          .map(function (r) {
+            if (!r || !r.name || !r.domain) return null;
+            return [r.name, r.domain];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.keywordAndRecipients) && s.keywordAndRecipients.length > 0) {
+      pushFile(
+        "KeywordAndRecipientsList.csv",
+        s.keywordAndRecipients
+          .map(function (r) {
+            if (!r || !r.keyword || !r.recipient) return null;
+            return [r.keyword, r.recipient];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    pushFile("ExternalDomainsWarningAndAutoChangeToBccSetting.csv", [
+      [
+        String((s.externalDomains && s.externalDomains.targetToAndCcExternalDomainsNum) || 10),
+        boolToYesNo(!!(s.externalDomains && s.externalDomains.isWarningWhenLargeNumberOfExternalDomains)),
+        boolToYesNo(!!(s.externalDomains && s.externalDomains.isProhibitedWhenLargeNumberOfExternalDomains)),
+        boolToYesNo(!!(s.externalDomains && s.externalDomains.isAutoChangeToBccWhenLargeNumberOfExternalDomains)),
+      ],
+    ]);
+
+    pushFile("ForceAutoChangeRecipientsToBcc.csv", [
+      [
+        boolToYesNo(!!(s.forceAutoChangeRecipientsToBcc && s.forceAutoChangeRecipientsToBcc.isForceAutoChangeRecipientsToBcc)),
+        normalizeString(s.forceAutoChangeRecipientsToBcc && s.forceAutoChangeRecipientsToBcc.toRecipient),
+        boolToYesNo(!!(s.forceAutoChangeRecipientsToBcc && s.forceAutoChangeRecipientsToBcc.isIncludeInternalDomain)),
+      ],
+    ]);
+
+    var att = s.attachmentsSetting || {};
+    pushFile("AttachmentsSetting.csv", [
+      [
+        boolToYesNo(!!att.isWarningWhenEncryptedZipIsAttached),
+        boolToYesNo(!!att.isProhibitedWhenEncryptedZipIsAttached),
+        boolToYesNo(!!att.isEnableAllAttachedFilesAreDetectEncryptedZip),
+        boolToYesNo(!!att.isAttachmentsProhibited),
+        boolToYesNo(!!att.isWarningWhenAttachedRealFile),
+        boolToYesNo(!!att.isEnableOpenAttachedFiles),
+        normalizeString(att.targetAttachmentFileExtensionOfOpen),
+        boolToYesNo(!!att.isMustOpenBeforeCheckTheAttachedFiles),
+        boolToYesNo(!!att.isIgnoreMustOpenBeforeCheckTheAttachedFilesIfInternalDomain),
+      ],
+    ]);
+
+    if (Array.isArray(s.attachmentProhibitedRecipients) && s.attachmentProhibitedRecipients.length > 0) {
+      pushFile(
+        "AttachmentProhibitedRecipients.csv",
+        s.attachmentProhibitedRecipients
+          .map(function (r) {
+            if (!r || !r.recipient) return null;
+            return [r.recipient];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.attachmentAlertRecipients) && s.attachmentAlertRecipients.length > 0) {
+      pushFile(
+        "AttachmentAlertRecipients.csv",
+        s.attachmentAlertRecipients
+          .map(function (r) {
+            if (!r || !r.recipient) return null;
+            return [r.recipient, normalizeString(r.message)];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.recipientsAndAttachmentsName) && s.recipientsAndAttachmentsName.length > 0) {
+      pushFile(
+        "RecipientsAndAttachmentsName.csv",
+        s.recipientsAndAttachmentsName
+          .map(function (r) {
+            if (!r || !r.attachmentsName || !r.recipient) return null;
+            return [r.attachmentsName, r.recipient];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    if (Array.isArray(s.autoDeleteRecipients) && s.autoDeleteRecipients.length > 0) {
+      pushFile(
+        "AutoDeleteRecipientList.csv",
+        s.autoDeleteRecipients
+          .map(function (r) {
+            if (!r || !r.recipient) return null;
+            return [r.recipient];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    var am = s.autoAddMessage || {};
+    pushFile("AutoAddMessage.csv", [
+      [
+        boolToYesNo(!!am.isAddToStart),
+        boolToYesNo(!!am.isAddToEnd),
+        normalizeString(am.messageOfAddToStart),
+        normalizeString(am.messageOfAddToEnd),
+      ],
+    ]);
+
+    var sec = s.securityForReceivedMail || {};
+    pushFile("SecurityForReceivedMail.csv", [
+      [
+        boolToYesNo(!!sec.isEnableSecurityForReceivedMail),
+        boolToYesNo(!!sec.isEnableAlertKeywordOfSubjectWhenOpeningMailsData),
+        boolToYesNo(!!sec.isEnableMailHeaderAnalysis),
+        boolToYesNo(!!sec.isShowWarningWhenSpfFails),
+        boolToYesNo(!!sec.isShowWarningWhenDkimFails),
+        boolToYesNo(!!sec.isEnableWarningFeatureWhenOpeningAttachments),
+        boolToYesNo(!!sec.isWarnBeforeOpeningAttachments),
+        boolToYesNo(!!sec.isWarnBeforeOpeningEncryptedZip),
+        boolToYesNo(!!sec.isWarnLinkFileInTheZip),
+        boolToYesNo(!!sec.isWarnOneFileInTheZip),
+        boolToYesNo(!!sec.isWarnOfficeFileWithMacroInTheZip),
+        boolToYesNo(!!sec.isWarnBeforeOpeningAttachmentsThatContainMacros),
+        boolToYesNo(!!sec.isShowWarningWhenSpoofingRisk),
+        boolToYesNo(!!sec.isShowWarningWhenDmarcNotImplemented),
+      ],
+    ]);
+
+    if (Array.isArray(s.alertKeywordOfSubjectWhenOpeningMail) && s.alertKeywordOfSubjectWhenOpeningMail.length > 0) {
+      pushFile(
+        "AlertKeywordOfSubjectWhenOpeningMailList.csv",
+        s.alertKeywordOfSubjectWhenOpeningMail
+          .map(function (r) {
+            if (!r || !r.alertKeyword) return null;
+            return [r.alertKeyword, normalizeString(r.message)];
+          })
+          .filter(Boolean)
+      );
+    }
+
+    return out;
   }
 
   function pGetRecipients(recipientsObj) {
@@ -743,6 +1710,9 @@
         if (r.isExternal) flags.push("<span class=\"pill warn\">External</span>");
         if (r.isWhite) flags.push("<span class=\"pill ok\">White</span>");
         if (r.isSkip) flags.push("<span class=\"pill\">Skip</span>");
+        if (r.isExpanded) flags.push("<span class=\"pill\">Expanded</span>");
+        if (r.isRegisteredInContacts === true) flags.push("<span class=\"pill ok\">In Contacts</span>");
+        if (r.isRegisteredInContacts === false) flags.push("<span class=\"pill warn\">Not in Contacts</span>");
         return "<li>" + esc(r.mailAddress) + " " + flags.join(" ") + "</li>";
       });
       return "<h2>" + esc(title) + "</h2>" + (items.length ? "<ul>" + items.join("") + "</ul>" : "<p class=\"hint\">(none)</p>");
@@ -815,6 +1785,10 @@
 
         state.settings = await MailChecker.settings.load();
         var snapshot = await buildSnapshotFromItem(item, state.settings);
+        try {
+          setStatus("Resolving contacts / distribution lists...");
+          await enrichSnapshotWithEws(snapshot, state.settings);
+        } catch (_e4) {}
         state.lastResult = MailChecker.engine.evaluate(snapshot, state.settings);
         renderCheckResult(state.lastResult);
         $("btn-apply").disabled = !state.lastResult || !state.lastResult.mutations;
@@ -887,7 +1861,7 @@
     $("btn-export-json").addEventListener("click", async function () {
       try {
         var s = state.settings || (await MailChecker.settings.load());
-        downloadText("mailchecker.settings.json", JSON.stringify(s, null, 2));
+        downloadText("mailchecker.settings.json", JSON.stringify(s, null, 2), "application/json;charset=utf-8");
         setStatus("Downloaded JSON.");
       } catch (e) {
         setStatus("Export failed: " + (e && e.message ? e.message : String(e)));
@@ -927,12 +1901,91 @@
         setStatus("Apply failed: " + (e && e.message ? e.message : String(e)));
       }
     });
+
+    function pReadFileAsText(file) {
+      return new Promise(function (resolve, reject) {
+        try {
+          var reader = new FileReader();
+          reader.onload = function () {
+            resolve(String(reader.result || ""));
+          };
+          reader.onerror = function () {
+            reject(new Error("Failed to read file"));
+          };
+          reader.readAsText(file);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }
+
+    $("btn-export-csv").addEventListener("click", async function () {
+      try {
+        var s2 = state.settings || (await MailChecker.settings.load());
+        var files = exportOutlookOkanCsvFiles(s2);
+        for (var i = 0; i < files.length; i++) {
+          downloadText(files[i].name, files[i].text, "text/csv;charset=utf-8");
+        }
+        setStatus("Downloaded CSV files (" + String(files.length) + ").");
+      } catch (e) {
+        setStatus("Export failed: " + (e && e.message ? e.message : String(e)));
+      }
+    });
+
+    $("file-import-csv").addEventListener("change", function (ev) {
+      (async function () {
+        try {
+          var files = ev && ev.target && ev.target.files ? ev.target.files : null;
+          if (!files || files.length === 0) return;
+
+          setStatus("Reading CSV files...");
+
+          var entries = [];
+          for (var i = 0; i < files.length; i++) {
+            var f = files[i];
+            var text = await pReadFileAsText(f);
+            entries.push({ name: f.name, text: text });
+          }
+
+          var baseSettings = state.settings || (await MailChecker.settings.load());
+          state.csvImport = applyOutlookOkanCsvFiles(baseSettings, entries);
+
+          var summary = (state.csvImport && state.csvImport.summary) || [];
+          $("csv-summary").textContent = summary.length ? summary.join("\n") : "(no recognized CSV files)";
+
+          setStatus("CSV loaded. Click Apply CSV to save.");
+        } catch (e) {
+          setStatus("CSV import failed: " + (e && e.message ? e.message : String(e)));
+        }
+      })();
+      try {
+        ev.target.value = "";
+      } catch (_e5) {}
+    });
+
+    $("btn-apply-csv").addEventListener("click", async function () {
+      try {
+        if (!state.csvImport || !state.csvImport.settings) {
+          setStatus("No CSV loaded.");
+          return;
+        }
+        await MailChecker.settings.save(state.csvImport.settings);
+        state.settings = await MailChecker.settings.load();
+        renderSettingsForm(state.settings);
+        setTextValue("json-editor", JSON.stringify(state.settings, null, 2));
+        $("csv-summary").textContent = "";
+        state.csvImport = null;
+        setStatus("Applied CSV.");
+      } catch (e) {
+        setStatus("Apply failed: " + (e && e.message ? e.message : String(e)));
+      }
+    });
   }
 
   async function init() {
     renderTabs();
 
-    var state = { settings: null, lastResult: null };
+    var state = { settings: null, lastResult: null, csvImport: null };
 
     try {
       state.settings = await MailChecker.settings.load();
