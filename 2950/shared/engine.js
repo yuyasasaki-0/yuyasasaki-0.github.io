@@ -146,9 +146,8 @@
   }
 
   function dedupeRecipients(to, cc, bcc) {
-    var seen = {};
-
     function filter(list) {
+      var seen = {};
       var out = [];
       for (var i = 0; i < list.length; i++) {
         var r = list[i];
@@ -210,7 +209,12 @@
       }
     } catch (_e2) {}
 
-    var seen = {};
+    var seenByField = {
+      to: {},
+      cc: {},
+      bcc: {},
+    };
+    var seenAll = {};
 
     function normalizeMembers(list) {
       if (!Array.isArray(list)) return [];
@@ -234,6 +238,8 @@
 
       var label = normalizeString(group.displayName) || groupEmail;
       var field = lower(normalizeString(group.field != null ? group.field : group.type));
+      var outField = field === "cc" ? "cc" : field === "bcc" ? "bcc" : "to";
+      var fieldSeen = seenByField[outField];
 
       var members = [];
       try {
@@ -245,19 +251,35 @@
       for (var m2 = 0; m2 < members.length; m2++) {
         var mem = members[m2];
         if (!mem || !mem.key) continue;
-        if (seen[mem.key]) continue;
-        seen[mem.key] = true;
+        var memberForField = mem;
+        if (!fieldSeen[mem.key]) {
+          fieldSeen[mem.key] = true;
+          memberForField = {
+            emailAddress: mem.emailAddress,
+            displayName: mem.displayName,
+            key: mem.key,
+            formatted: mem.formatted,
+          };
 
-        if (label) {
-          mem.expandedFrom = label;
-          mem.formatted = mem.formatted + " [" + label + "]";
+          if (label) {
+            memberForField.expandedFrom = label;
+            memberForField.formatted = memberForField.formatted + " [" + label + "]";
+          }
+
+          if (outField === "cc") out.cc.push(memberForField);
+          else if (outField === "bcc") out.bcc.push(memberForField);
+          else out.to.push(memberForField);
         }
 
-        if (field === "cc") out.cc.push(mem);
-        else if (field === "bcc") out.bcc.push(mem);
-        else out.to.push(mem);
-
-        out.all.push(mem);
+        if (!seenAll[mem.key]) {
+          seenAll[mem.key] = true;
+          out.all.push({
+            emailAddress: mem.emailAddress,
+            displayName: mem.displayName,
+            key: mem.key,
+            formatted: mem.formatted,
+          });
+        }
       }
     }
 
@@ -701,14 +723,13 @@
       if (!e || e.indexOf("@") < 0) return;
       var key = lower(e);
 
-      var all = to.concat(cc).concat(bcc);
-      for (var i = 0; i < all.length; i++) {
-        if (all[i].key === key) return;
+      var fieldList = field === "Cc" ? cc : bcc;
+      for (var i = 0; i < fieldList.length; i++) {
+        if (fieldList[i].key === key) return;
       }
 
       var r = { emailAddress: e, displayName: "", key: key, formatted: e };
-      if (field === "Cc") cc.push(r);
-      else bcc.push(r);
+      fieldList.push(r);
 
       pushAlert(
         checkList,
@@ -765,10 +786,9 @@
       }
     }
 
-    if (!!g.isAutoAddSenderToCc || !!g.isAutoAddSenderToBcc) {
-      if (senderEmail && senderEmail.indexOf("@") >= 0) {
-        addRecipient(!!g.isAutoAddSenderToCc ? "Cc" : "Bcc", senderEmail, "sender");
-      }
+    if (senderEmail && senderEmail.indexOf("@") >= 0) {
+      if (!!g.isAutoAddSenderToCc) addRecipient("Cc", senderEmail, "sender");
+      if (!!g.isAutoAddSenderToBcc) addRecipient("Bcc", senderEmail, "sender");
     }
 
     return {
@@ -832,9 +852,8 @@
 
   function applyRecipientChecks(checkList, recipients, settings, locale, internalDomains, effectiveWhitelist, expandedByField) {
     var alerts = Array.isArray(settings.alertAddresses) ? settings.alertAddresses : [];
-    var seen = {};
 
-    function addAddress(outList, recipient) {
+    function addAddress(outList, recipient, seen) {
       var email = recipient.emailAddress;
       var key = lower(email);
       if (key && seen[key]) return;
@@ -877,18 +896,22 @@
       }
     }
 
-    for (var i = 0; i < recipients.to.length; i++) addAddress(checkList.toAddresses, recipients.to[i]);
-    for (var j = 0; j < recipients.cc.length; j++) addAddress(checkList.ccAddresses, recipients.cc[j]);
-    for (var k = 0; k < recipients.bcc.length; k++) addAddress(checkList.bccAddresses, recipients.bcc[k]);
+    var seenTo = {};
+    var seenCc = {};
+    var seenBcc = {};
+
+    for (var i = 0; i < recipients.to.length; i++) addAddress(checkList.toAddresses, recipients.to[i], seenTo);
+    for (var j = 0; j < recipients.cc.length; j++) addAddress(checkList.ccAddresses, recipients.cc[j], seenCc);
+    for (var k = 0; k < recipients.bcc.length; k++) addAddress(checkList.bccAddresses, recipients.bcc[k], seenBcc);
 
     var ex = expandedByField || {};
     var exTo = Array.isArray(ex.to) ? ex.to : [];
     var exCc = Array.isArray(ex.cc) ? ex.cc : [];
     var exBcc = Array.isArray(ex.bcc) ? ex.bcc : [];
 
-    for (var e1 = 0; e1 < exTo.length; e1++) addAddress(checkList.toAddresses, exTo[e1]);
-    for (var e2 = 0; e2 < exCc.length; e2++) addAddress(checkList.ccAddresses, exCc[e2]);
-    for (var e3 = 0; e3 < exBcc.length; e3++) addAddress(checkList.bccAddresses, exBcc[e3]);
+    for (var e1 = 0; e1 < exTo.length; e1++) addAddress(checkList.toAddresses, exTo[e1], seenTo);
+    for (var e2 = 0; e2 < exCc.length; e2++) addAddress(checkList.ccAddresses, exCc[e2], seenCc);
+    for (var e3 = 0; e3 < exBcc.length; e3++) addAddress(checkList.bccAddresses, exBcc[e3], seenBcc);
 
     return checkList;
   }
